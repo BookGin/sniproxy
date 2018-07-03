@@ -29,11 +29,16 @@
 #include <sys/queue.h>
 #include <pcre.h>
 #include <assert.h>
+
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+
 #include "backend.h"
 #include "address.h"
 #include "logger.h"
 
 
+static unsigned char *b32decode(const char *, size_t);
 static void free_backend(struct Backend *);
 static char *backend_config_options(const struct Backend *);
 
@@ -115,6 +120,91 @@ init_backend(struct Backend *backend) {
     }
 
     return 1;
+}
+
+static unsigned char *
+b32decode(const char *input, size_t input_len) {
+    static unsigned char output[32];
+
+    assert(input_len == 52);
+    int idx = 0;
+    int bit = 0;
+    int buffer = 0;
+    for (int i = 0; i < input_len; i++) {
+        char c = input[i];
+        if ('0' <= c && c <= '9')
+            c = 26 + (c - '0');
+        else if ('a' <= c && c <= 'z')
+            c -= 'a';
+        else
+            return NULL;
+        if (i == (input_len - 1)) {
+            buffer = (buffer<<1) + c;
+            bit += 1;
+        } else {
+            buffer = (buffer<<5) + c;
+            bit += 5;
+        }
+        if (bit >= 8) {
+            output[idx++] = buffer>>(bit-8);
+            bit -= 8;
+            buffer &= (1<<bit) -1;
+        }
+    }
+    return output;
+}
+
+struct Backend *
+lookup_damup_backend(const struct Backend_head *head, const char *name, size_t name_len) {
+    if (name == NULL) {
+        name = "";
+        name_len = 0;
+    }
+
+    // We will only check the first backend
+    struct Backend *first_backend = STAILQ_FIRST(head);
+    assert(first_backend->pattern_re != NULL);
+    // the pattern is the hmac key
+    assert(first_backend->pattern != NULL);
+    unsigned char* hmac_key = (unsigned char*) first_backend->pattern;
+    // TODO: should not use strlen to retrive bytes
+    size_t hmac_key_len = strlen(first_backend->pattern);
+
+
+    // HMAC_MSG-HMAC_VALUE.blablabla.com
+    const unsigned char* hmac_msg = (unsigned char*) name;
+    size_t hmac_msg_len = -1;
+    const char* b32_hmac_value = NULL;
+    size_t b32_hmac_value_len = -1;
+
+    // search for the first dash
+    size_t idx;
+    for (idx = 0; idx < name_len && hmac_msg_len == -1; idx++) {
+        if (name[idx] == '-') {
+            hmac_msg_len = idx;
+            b32_hmac_value = name + idx + 1;
+        }
+    }
+
+    // search for the next dot
+    for (size_t i = idx; i < name_len && b32_hmac_value_len == -1; i++) {
+        if (name[i] == '.')
+            b32_hmac_value_len = i - idx;
+    }
+
+    if (hmac_msg_len != 10 || b32_hmac_value_len != 52) {
+      info("HMAC format is not correct");
+      return NULL;
+    }
+
+    // using HMAC static buffer
+    unsigned char *buf = HMAC(EVP_sha256(), hmac_key, hmac_key_len, hmac_msg, hmac_msg_len, NULL, NULL);
+    // using b32decode static buffer
+    unsigned char *hmac_value = b32decode(b32_hmac_value, b32_hmac_value_len);
+    if (0 == memcmp(buf, hmac_value, 32))
+        return first_backend;
+    info("HMAC verification failed");
+    return NULL;
 }
 
 struct Backend *

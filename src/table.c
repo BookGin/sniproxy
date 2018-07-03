@@ -39,6 +39,9 @@ static void free_table(struct Table *);
 
 static inline struct Backend *
 table_lookup_backend(const struct Table *table, const char *name, size_t name_len) {
+    if (0 == strcmp(table->name, "damup"))
+        return lookup_damup_backend(&table->backends, name, name_len);
+
     return lookup_backend(&table->backends, name, name_len);
 }
 
