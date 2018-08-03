@@ -25,10 +25,12 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/queue.h>
 #include <pcre.h>
 #include <assert.h>
+#include <time.h>
 
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -39,6 +41,7 @@
 
 
 static unsigned char *b32decode(const char *, size_t);
+static void parseFields(const char *, size_t, char fields[3][2048]);
 static void free_backend(struct Backend *);
 static char *backend_config_options(const struct Backend *);
 
@@ -122,6 +125,24 @@ init_backend(struct Backend *backend) {
     return 1;
 }
 
+static void
+parseFields(const char *_name, size_t name_len, char fields[3][2048]) {
+    // CLIENT_ID.VALIDUNTIL_UNIXTIMESTAMP.HMAC_VALUE.example.com
+    assert(name_len < 2048 - 1);
+    char name[2048] = {0};
+    strncpy(name, _name, 2048 - 1);
+    char *p = name;
+    char *start = name;
+    for (int i = 0; i < 3 && p < name + name_len; i++) {
+      while (*p != '.' && *p != '\0')
+        p++;
+      *p = '\0';
+      p++;
+      strncpy(fields[i], start, 2048 - 1);
+      start = p;
+    }
+}
+
 static unsigned char *
 b32decode(const char *input, size_t input_len) {
     static unsigned char output[32];
@@ -161,6 +182,8 @@ lookup_damup_backend(const struct Backend_head *head, const char *name, size_t n
         name_len = 0;
     }
 
+    printf("%s\n", name);
+
     // We will only check the first backend
     struct Backend *first_backend = STAILQ_FIRST(head);
     assert(first_backend->pattern_re != NULL);
@@ -171,40 +194,46 @@ lookup_damup_backend(const struct Backend_head *head, const char *name, size_t n
     size_t hmac_key_len = strlen(first_backend->pattern);
 
 
-    // HMAC_MSG-HMAC_VALUE.blablabla.com
-    const unsigned char* hmac_msg = (unsigned char*) name;
-    size_t hmac_msg_len = -1;
-    const char* b32_hmac_value = NULL;
-    size_t b32_hmac_value_len = -1;
+    // CLIENT_ID.VALIDUNTIL_UNIXTIMESTAMP.HMAC_VALUE.example.com
+    char fields[3][2048] = {{0}};
+    parseFields(name, name_len, fields);
 
-    // search for the first dash
-    size_t idx;
-    for (idx = 0; idx < name_len && hmac_msg_len == -1; idx++) {
-        if (name[idx] == '-') {
-            hmac_msg_len = idx;
-            b32_hmac_value = name + idx + 1;
-        }
-    }
+    const char * const client_id = fields[0];
+    size_t client_id_len = strlen(client_id);
+    const char * const valid_until_timestamp_str = fields[1];
+    size_t valid_until_timestamp_str_len = strlen(valid_until_timestamp_str);
+    const char * const b32_hmac_value = fields[2];
+    size_t b32_hmac_value_len = strlen(b32_hmac_value);
 
-    // search for the next dot
-    for (size_t i = idx; i < name_len && b32_hmac_value_len == -1; i++) {
-        if (name[i] == '.')
-            b32_hmac_value_len = i - idx;
-    }
-
-    if (hmac_msg_len != 10 || b32_hmac_value_len != 52) {
-      info("HMAC format is not correct");
+    // First, check the signature
+    if (b32_hmac_value_len != 52) {
+      info("HMAC value format is not correct");
       return NULL;
     }
-
+    char hmac_msg[2048] = {0};
+    strncpy(hmac_msg, client_id, 2048 - 1);
+    hmac_msg[client_id_len] = '.';
+    strncpy(hmac_msg + client_id_len + 1, valid_until_timestamp_str, 2048 - 1 - client_id_len);
+    size_t hmac_msg_len = strlen(hmac_msg);
+    assert(client_id_len + valid_until_timestamp_str_len + 1 == hmac_msg_len);
     // using HMAC static buffer
     unsigned char *buf = HMAC(EVP_sha256(), hmac_key, hmac_key_len, hmac_msg, hmac_msg_len, NULL, NULL);
     // using b32decode static buffer
     unsigned char *hmac_value = b32decode(b32_hmac_value, b32_hmac_value_len);
-    if (0 == memcmp(buf, hmac_value, 32))
-        return first_backend;
-    info("HMAC verification failed");
-    return NULL;
+    if (0 != memcmp(buf, hmac_value, 32)) {
+        info("HMAC verification failed");
+        return NULL;
+    }
+
+    // Check the life of the token
+    unsigned long valid_until_timestamp = strtoul(valid_until_timestamp_str, NULL, 0);
+    unsigned long current_timestamp = (unsigned long)time(NULL);
+    if (valid_until_timestamp <= current_timestamp) {
+      info("Token expired");
+      return NULL;
+    }
+
+    return first_backend;
 }
 
 struct Backend *
