@@ -40,7 +40,7 @@
 #include "logger.h"
 
 
-static unsigned char *b32decode(const char *, size_t);
+static unsigned char *b32sha1decode(const char *, size_t);
 static void parseFields(const char *, size_t, char fields[3][2048]);
 static void free_backend(struct Backend *);
 static char *backend_config_options(const struct Backend *);
@@ -134,7 +134,7 @@ parseFields(const char *_name, size_t name_len, char fields[3][2048]) {
     char *p = name;
     char *start = name;
     for (int i = 0; i < 3 && p < name + name_len; i++) {
-      while (*p != '.' && *p != '\0')
+      while (*p != '-' && *p != '.' && *p != '\0')
         p++;
       *p = '\0';
       p++;
@@ -144,10 +144,9 @@ parseFields(const char *_name, size_t name_len, char fields[3][2048]) {
 }
 
 static unsigned char *
-b32decode(const char *input, size_t input_len) {
-    static unsigned char output[32];
+b32sha1decode(const char *input, size_t input_len) {
+    static unsigned char output[20];
 
-    assert(input_len == 52);
     int idx = 0;
     int bit = 0;
     int buffer = 0;
@@ -159,13 +158,8 @@ b32decode(const char *input, size_t input_len) {
             c -= 'a';
         else
             return NULL;
-        if (i == (input_len - 1)) {
-            buffer = (buffer<<1) + c;
-            bit += 1;
-        } else {
-            buffer = (buffer<<5) + c;
-            bit += 5;
-        }
+        buffer = (buffer<<5) + c;
+        bit += 5;
         if (bit >= 8) {
             output[idx++] = buffer>>(bit-8);
             bit -= 8;
@@ -182,7 +176,7 @@ lookup_damup_backend(const struct Backend_head *head, const char *name, size_t n
         name_len = 0;
     }
 
-    printf("%s\n", name);
+    //printf("%s\n", name);
 
     // We will only check the first backend
     struct Backend *first_backend = STAILQ_FIRST(head);
@@ -206,29 +200,38 @@ lookup_damup_backend(const struct Backend_head *head, const char *name, size_t n
     size_t b32_hmac_value_len = strlen(b32_hmac_value);
 
     // First, check the signature
-    if (b32_hmac_value_len != 52) {
+    if (b32_hmac_value_len != 32) {
       info("HMAC value format is not correct");
       return NULL;
     }
     char hmac_msg[2048] = {0};
     strncpy(hmac_msg, client_id, 2048 - 1);
-    hmac_msg[client_id_len] = '.';
+    hmac_msg[client_id_len] = '-';
     strncpy(hmac_msg + client_id_len + 1, valid_until_timestamp_str, 2048 - 1 - client_id_len);
     size_t hmac_msg_len = strlen(hmac_msg);
     assert(client_id_len + valid_until_timestamp_str_len + 1 == hmac_msg_len);
+    //printf("HMAC: key %s / %d\n", hmac_key, hmac_key_len);
+    //printf("HMAC: msg %s / %d\n", hmac_msg, hmac_msg_len);
     // using HMAC static buffer
-    unsigned char *buf = HMAC(EVP_sha256(), hmac_key, hmac_key_len, hmac_msg, hmac_msg_len, NULL, NULL);
-    // using b32decode static buffer
-    unsigned char *hmac_value = b32decode(b32_hmac_value, b32_hmac_value_len);
-    if (0 != memcmp(buf, hmac_value, 32)) {
+    unsigned char *buf = HMAC(EVP_sha1(), hmac_key, hmac_key_len, hmac_msg, hmac_msg_len, NULL, NULL);
+    // using b32sha1decode static buffer
+    unsigned char *hmac_value = b32sha1decode(b32_hmac_value, b32_hmac_value_len);
+    for (int i = 0; i < 20; i++)
+    //printf("HMAC:  %u / %u\n", buf[i], hmac_value[i]);
+    if (0 != memcmp(buf, hmac_value, 20)) {
         info("HMAC verification failed");
         return NULL;
     }
-
     // Check the life of the token
-    unsigned long valid_until_timestamp = strtoul(valid_until_timestamp_str, NULL, 0);
+    unsigned char *valid_until_timestamp_ord = b32sha1decode(valid_until_timestamp_str, valid_until_timestamp_str_len);
+    unsigned int timestamp = 0;
+    for (int i = 0; i < 4; i++) {
+      //printf("timest: %u\n", valid_until_timestamp_ord[i]);
+      timestamp += (unsigned int)valid_until_timestamp_ord[i] * (0x1000000u>>(i*8));
+    }
     unsigned long current_timestamp = (unsigned long)time(NULL);
-    if (valid_until_timestamp <= current_timestamp) {
+    //printf("cur: %u expired to %u\n", current_timestamp, timestamp);
+    if (timestamp <= current_timestamp) {
       info("Token expired");
       return NULL;
     }
